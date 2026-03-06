@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+import os  # For saving drawings with timestamped filenames
 from hand_tracking_module import HandTracker
 
 def main():
@@ -72,11 +73,23 @@ def main():
     tracker = HandTracker()
 
     # Canvas settings
+    # Logical canvas size (display is later resized to window size so it fills screen)
     canvas_width, canvas_height = 640, 480
     canvas = np.ones((canvas_height, canvas_width, 3), np.uint8) * 255  # White canvas
-
+    
     # Drawing settings
-    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # Blue, Green, Red (BGR)
+    # Extended color palette (BGR)
+    colors = [
+        (255, 0, 0),    # Blue
+        (0, 255, 0),    # Green
+        (0, 0, 255),    # Red
+        (0, 255, 255),  # Yellow
+        (255, 0, 255),  # Purple
+        (0, 0, 0),      # Black
+    ]
+    color_names = ['Blue', 'Green', 'Red', 'Yellow', 'Purple', 'Black']
+    current_color_index = 0
+    current_color = colors[current_color_index]
     thicknesses = [2, 5, 8]  # Thin, Medium, Thick
     current_color = colors[0]
     current_thickness = thicknesses[0]
@@ -95,14 +108,27 @@ def main():
     button_press_cooldown = 0
 
     # UI Buttons: dict of name: (x1, y1, x2, y2)
+    # Color buttons are mapped to indices in the colors list above.
     buttons = {
         'color_blue': (10, 10, 60, 60),
-        'color_green': (80, 10, 130, 60),
-        'color_red': (150, 10, 200, 60),
+        'color_green': (70, 10, 120, 60),
+        'color_red': (130, 10, 180, 60),
+        'color_yellow': (190, 10, 240, 60),
+        'color_purple': (250, 10, 300, 60),
+        'color_black': (310, 10, 360, 60),
         'thin': (10, 80, 60, 130),
         'medium': (80, 80, 130, 130),
         'thick': (150, 80, 200, 130),
         'eraser': (10, 150, 60, 200)
+    }
+
+    color_button_indices = {
+        'color_blue': 0,
+        'color_green': 1,
+        'color_red': 2,
+        'color_yellow': 3,
+        'color_purple': 4,
+        'color_black': 5,
     }
 
     def draw_ui(img, hovered_button_name=None):
@@ -117,10 +143,9 @@ def main():
             # Highlight selected color/thickness
             is_selected = False
             if name.startswith('color_'):
-                color_name = name.split('_')[1]
-                if (color_name == 'blue' and current_color == colors[0]) or \
-                   (color_name == 'green' and current_color == colors[1]) or \
-                   (color_name == 'red' and current_color == colors[2]):
+                # Highlight the currently selected color button
+                idx = color_button_indices.get(name, -1)
+                if idx == current_color_index:
                     is_selected = True
             elif name == 'thin' and current_thickness == thicknesses[0]:
                 is_selected = True
@@ -148,13 +173,10 @@ def main():
             
             center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
             if name.startswith('color_'):
-                color_name = name.split('_')[1]
-                if color_name == 'blue':
-                    cv2.circle(img, (center_x, center_y), 15, colors[0], -1)
-                elif color_name == 'green':
-                    cv2.circle(img, (center_x, center_y), 15, colors[1], -1)
-                elif color_name == 'red':
-                    cv2.circle(img, (center_x, center_y), 15, colors[2], -1)
+                # Draw color swatch corresponding to this button
+                idx = color_button_indices.get(name, None)
+                if idx is not None and 0 <= idx < len(colors):
+                    cv2.circle(img, (center_x, center_y), 15, colors[idx], -1)
             elif name == 'thin':
                 cv2.line(img, (x1 + 10, center_y), (x2 - 10, center_y), (0, 0, 0), 2)
             elif name == 'medium':
@@ -178,7 +200,25 @@ def main():
     
     # Create window first
     cv2.namedWindow('Virtual Whiteboard', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Virtual Whiteboard', 640, 480)
+    # Try to start in fullscreen so the whiteboard fills the screen
+    try:
+        cv2.setWindowProperty('Virtual Whiteboard', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    except Exception:
+        # If fullscreen is not supported, window will remain resizable
+        pass
+
+    # For smoothing drawing coordinates
+    prev_draw_point = None
+    # For smoothing pointer (used for selection and hover)
+    prev_pointer = None
+    pointer_alpha = 0.25  # Lower = smoother, higher = more responsive
+
+    # Hover/debounce tracking for button selection
+    hover_frames = 0
+    hover_threshold = 6  # Number of consecutive frames to consider a hover stable
+    last_hovered_name = None
+    # Previous landmarks for temporal smoothing
+    prev_lm_list = None
     
     while True:
         # Check if window was closed
@@ -210,17 +250,48 @@ def main():
             frame = cv2.flip(frame, 1)  # Mirror the frame
             frame = tracker.find_hands(frame)  # Detect hands and draw landmarks
             lm_list = tracker.get_positions(frame)
+            # Apply temporal smoothing to landmarks if available
             if lm_list and len(lm_list) >= 21:
+                lm_list = tracker.smooth_landmarks(lm_list, prev_lm_list, alpha=0.45)
+                # Store a copy for next frame
+                prev_lm_list = [list(x) for x in lm_list]
                 current_fingers = tracker.fingers_up(lm_list)
+            else:
+                prev_lm_list = None
 
         if lm_list and len(lm_list) >= 21 and len(current_fingers) == 5:
             fingers = current_fingers
             if len(fingers) == 5:  # Ensure we got valid finger states
                 index_tip = lm_list[8]  # Index finger tip
-                x, y = index_tip[1], index_tip[2]
+
+                # NOTE: HandTracker already returns coordinates in image space.
+                # Apply separate smoothing for the pointer used to select UI buttons
+                raw_x, raw_y = index_tip[1], index_tip[2]
+
+                frame_h, frame_w = frame.shape[:2]
+                raw_x = int(raw_x * canvas_width / frame_w)
+                raw_y = int(raw_y * canvas_height / frame_h)
+
+                # Pointer EMA smoothing (keeps selection stable even when not drawing)
+                if prev_pointer is None:
+                    ptr_x, ptr_y = raw_x, raw_y
+                else:
+                    ptr_x = int(pointer_alpha * raw_x + (1 - pointer_alpha) * prev_pointer[0])
+                    ptr_y = int(pointer_alpha * raw_y + (1 - pointer_alpha) * prev_pointer[1])
+                prev_pointer = (ptr_x, ptr_y)
+
+                # Smooth drawing coordinates separately (so strokes remain responsive)
+                if prev_draw_point is None:
+                    smooth_x, smooth_y = ptr_x, ptr_y
+                else:
+                    alpha = 0.3  # Higher = closer to current position (for drawing responsiveness)
+                    smooth_x = int(alpha * ptr_x + (1 - alpha) * prev_draw_point[0])
+                    smooth_y = int(alpha * ptr_y + (1 - alpha) * prev_draw_point[1])
+
+                x, y = smooth_x, smooth_y
 
                 # Determine mode based on gestures
-                if fingers == [0, 1, 0, 0, 0]:  # Only index finger up
+                if fingers[1] == 1 and fingers[2] == 0:  # Only index finger up
                     if eraser_mode:
                         # In eraser mode, index finger is for erasing (handled separately)
                         drawing_mode = False
@@ -229,7 +300,7 @@ def main():
                         # Normal drawing mode
                         drawing_mode = True
                         selection_mode = False
-                elif fingers == [0, 1, 1, 0, 0]:  # Index and middle fingers up
+                elif fingers[1] == 1 and fingers[2] == 1:  # Index and middle fingers up
                     selection_mode = True
                     drawing_mode = False
                     # Don't disable eraser_mode here - let user select eraser button again or use gesture
@@ -259,66 +330,77 @@ def main():
                         current_stroke = {'points': [(x, y)], 'color': current_color, 'thickness': current_thickness}
                     else:
                         current_stroke['points'].append((x, y))
+                    # Update previous point for smoothing
+                    prev_draw_point = (x, y)
                 else:
                     # Stop current stroke if not drawing
                     if current_stroke:
                         strokes.append(current_stroke)
                         current_stroke = None
+                    prev_draw_point = None
 
                 # Handle selection (with debouncing)
                 if selection_mode:
                     button_press_cooldown = max(0, button_press_cooldown - 1)
-                    
-                    # Clamp coordinates to canvas bounds for button detection
-                    x_btn = max(0, min(canvas_width - 1, x))
-                    y_btn = max(0, min(canvas_height - 1, y))
-                    
+
+                    # Use the smoothed pointer for button detection (ptr_x, ptr_y)
+                    x_btn = max(0, min(canvas_width - 1, ptr_x))
+                    y_btn = max(0, min(canvas_height - 1, ptr_y))
+
+                    # Detect hovered button (don't trigger selection immediately)
+                    margin = 15  # Larger margin to make hovering easier
+                    hovered_button_name = None
                     for name, (x1, y1, x2, y2) in buttons.items():
-                        # Check if finger is over button (with larger margin for easier selection)
-                        margin = 10  # Increased margin
                         if (x1 - margin) <= x_btn <= (x2 + margin) and (y1 - margin) <= y_btn <= (y2 + margin):
                             hovered_button_name = name
-                            
-                            # Only trigger if this is a new button press (debouncing)
-                            if name != last_selected_button and button_press_cooldown == 0:
-                                if name == 'color_blue':
-                                    current_color = colors[0]
-                                    print("✓ Selected: Blue color")
-                                elif name == 'color_green':
-                                    current_color = colors[1]
-                                    print("✓ Selected: Green color")
-                                elif name == 'color_red':
-                                    current_color = colors[2]
-                                    print("✓ Selected: Red color")
-                                elif name == 'thin':
-                                    current_thickness = thicknesses[0]
-                                    print("✓ Selected: Thin brush")
-                                elif name == 'medium':
-                                    current_thickness = thicknesses[1]
-                                    print("✓ Selected: Medium brush")
-                                elif name == 'thick':
-                                    current_thickness = thicknesses[2]
-                                    print("✓ Selected: Thick brush")
-                                elif name == 'eraser':
-                                    # Toggle eraser mode
-                                    if eraser_mode:
-                                        eraser_mode = False
-                                        drawing_mode = True
-                                        print("✓ Eraser mode deactivated - back to drawing")
-                                    else:
-                                        eraser_mode = True
-                                        drawing_mode = False
-                                        selection_mode = False
-                                        print("✓ Eraser mode activated - use index finger to erase")
-                                
-                                last_selected_button = name
-                                button_press_cooldown = 15  # Increased cooldown frames
-                                break
+                            break
+
+                    # Sustained-hover debouncing: require stable hover for several frames
+                    if hovered_button_name == last_hovered_name:
+                        hover_frames += 1
+                    else:
+                        hover_frames = 1 if hovered_button_name else 0
+                    last_hovered_name = hovered_button_name
+
+                    if hovered_button_name and hover_frames >= hover_threshold and button_press_cooldown == 0 and hovered_button_name != last_selected_button:
+                        name = hovered_button_name
+                        if name.startswith('color_'):
+                            idx = color_button_indices.get(name, None)
+                            if idx is not None and 0 <= idx < len(colors):
+                                current_color_index = idx
+                                current_color = colors[current_color_index]
+                                print(f"[SELECTED] {color_names[current_color_index]} color")
+                        elif name == 'thin':
+                            current_thickness = thicknesses[0]
+                            print("[SELECTED] Thin brush")
+                        elif name == 'medium':
+                            current_thickness = thicknesses[1]
+                            print("[SELECTED] Medium brush")
+                        elif name == 'thick':
+                            current_thickness = thicknesses[2]
+                            print("[SELECTED] Thick brush")
+                        elif name == 'eraser':
+                            if eraser_mode:
+                                eraser_mode = False
+                                drawing_mode = True
+                                print("[ERASER] Deactivated - back to drawing")
+                            else:
+                                eraser_mode = True
+                                drawing_mode = False
+                                selection_mode = False
+                                print("[ERASER] Activated - use index finger to erase")
+
+                        last_selected_button = name
+                        button_press_cooldown = 15
+                        hover_frames = 0
                 else:
                     # Reset button selection when not in selection mode
                     if last_selected_button is not None:
                         last_selected_button = None
                         button_press_cooldown = 0
+                    # Reset hover tracking
+                    hover_frames = 0
+                    last_hovered_name = None
 
                 # Handle erasing (works with index finger when eraser mode is active)
                 if eraser_mode:
@@ -345,13 +427,15 @@ def main():
                 if current_stroke:
                     strokes.append(current_stroke)
                     current_stroke = None
+                prev_draw_point = None
         else:
             # If no hand detected, stop current stroke
             if current_stroke:
                 strokes.append(current_stroke)
                 current_stroke = None
+            prev_draw_point = None
 
-        # Create display canvas
+        # Create display canvas (pure drawing surface; UI and overlays added later)
         display = canvas.copy()
 
         # Draw all strokes
@@ -368,7 +452,15 @@ def main():
                 for i in range(len(points) - 1):
                     cv2.line(display, points[i], points[i + 1], current_stroke['color'], current_stroke['thickness'])
 
-        # Draw UI
+        # Draw fingertip indicator on drawing canvas (for visual feedback)
+        if lm_list and len(lm_list) >= 21 and len(current_fingers) == 5:
+            index_tip = lm_list[8]
+            fx, fy = index_tip[1], index_tip[2]
+            fx = max(0, min(canvas_width - 1, fx))
+            fy = max(0, min(canvas_height - 1, fy))
+            cv2.circle(display, (fx, fy), 5, (0, 0, 0), -1)  # Small black dot
+
+        # Draw UI (buttons, etc.)
         draw_ui(display, hovered_button_name)
 
         # Add mode indicator
@@ -381,7 +473,7 @@ def main():
             else:
                 mode_text = "MODE: SELECTION (Point at buttons to select)"
         elif drawing_mode:
-            mode_text = f"MODE: DRAWING (Color: {['Blue', 'Green', 'Red'][colors.index(current_color)]}, Thickness: {current_thickness}px)"
+            mode_text = f"MODE: DRAWING (Color: {color_names[current_color_index]}, Thickness: {current_thickness}px)"
         else:
             mode_text = "MODE: IDLE (Raise index finger to draw)"
         
@@ -399,15 +491,70 @@ def main():
         if eraser_mode and lm_list and len(lm_list) >= 21 and len(current_fingers) == 5:
             index_tip = lm_list[8]
             ex, ey = index_tip[1], index_tip[2]
+            ex = max(0, min(canvas_width - 1, ex))
+            ey = max(0, min(canvas_height - 1, ey))
             cv2.circle(display, (ex, ey), 25, (0, 0, 255), 2)  # Red circle indicator
-        
+
+        # Add live camera preview in the bottom-right corner (does not block the main canvas)
+        if frame is not None:
+            # Create a small preview while preserving aspect ratio
+            disp_h, disp_w = display.shape[:2]
+            preview_width = max(int(disp_w * 0.25), 1)
+            preview_height = int(preview_width * frame.shape[0] / max(frame.shape[1], 1))
+            preview_height = min(preview_height, int(disp_h * 0.25))
+            preview_width = int(preview_height * frame.shape[1] / max(frame.shape[0], 1))
+
+            if preview_width > 0 and preview_height > 0:
+                preview = cv2.resize(frame, (preview_width, preview_height))
+                y1 = disp_h - preview_height - 10
+                x1 = disp_w - preview_width - 10
+                y2 = y1 + preview_height
+                x2 = x1 + preview_width
+
+                if y1 >= 0 and x1 >= 0 and y2 <= disp_h and x2 <= disp_w:
+                    display[y1:y2, x1:x2] = preview
+                    cv2.rectangle(display, (x1, y1), (x2, y2), (0, 0, 0), 1)
+                    cv2.putText(display, "Camera", (x1 + 5, y1 + 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+        # Resize display to current window size so the whiteboard fills the screen
+        try:
+            _, _, win_w, win_h = cv2.getWindowImageRect('Virtual Whiteboard')
+            if win_w > 0 and win_h > 0 and (win_w != display.shape[1] or win_h != display.shape[0]):
+                display_to_show = cv2.resize(display, (win_w, win_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                display_to_show = display
+        except Exception:
+            display_to_show = display
+
         # Show the whiteboard
-        cv2.imshow('Virtual Whiteboard', display)
+        cv2.imshow('Virtual Whiteboard', display_to_show)
 
         # Exit on 'q', 'Q', or ESC key, or window close button
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == ord('Q') or key == 27:  # 27 is ESC key
             break
+        elif key == ord('s') or key == ord('S'):
+            # Save only the drawing canvas (without UI/camera preview) to a timestamped PNG
+            save_canvas = np.ones_like(canvas) * 255
+            for stroke in strokes:
+                pts = stroke['points']
+                if len(pts) > 1:
+                    for i in range(len(pts) - 1):
+                        cv2.line(save_canvas, pts[i], pts[i + 1], stroke['color'], stroke['thickness'])
+            if current_stroke:
+                pts = current_stroke['points']
+                if len(pts) > 1:
+                    for i in range(len(pts) - 1):
+                        cv2.line(save_canvas, pts[i], pts[i + 1], current_stroke['color'], current_stroke['thickness'])
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"drawing_{timestamp}.png"
+            try:
+                cv2.imwrite(filename, save_canvas)
+                print(f"Saved drawing to {os.path.abspath(filename)}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save drawing: {e}")
         
         # Check if window was closed
         if cv2.getWindowProperty('Virtual Whiteboard', cv2.WND_PROP_VISIBLE) < 1:

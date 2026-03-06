@@ -71,6 +71,29 @@ class HandTracker:
                     lm_list.append([id, cx, cy])
         return lm_list
 
+    def smooth_landmarks(self, lm_list, prev_lm_list, alpha=0.4):
+        """
+        Smooth landmark coordinates using an exponential moving average.
+        Returns a new list of landmarks.
+
+        Args:
+            lm_list: current landmarks as [[id, x, y], ...]
+            prev_lm_list: previous landmarks or None
+            alpha: smoothing factor (0..1) higher is less smoothing
+        """
+        if not lm_list:
+            return lm_list
+        if prev_lm_list is None or len(prev_lm_list) != len(lm_list):
+            return lm_list.copy()
+
+        smoothed = []
+        for cur, prev in zip(lm_list, prev_lm_list):
+            idc = cur[0]
+            x = int(alpha * cur[1] + (1 - alpha) * prev[1])
+            y = int(alpha * cur[2] + (1 - alpha) * prev[2])
+            smoothed.append([idc, x, y])
+        return smoothed
+
     def fingers_up(self, lm_list):
         """
         Determine which fingers are up.
@@ -81,21 +104,31 @@ class HandTracker:
         Returns:
             fingers: List of finger states (1 if up, 0 if down).
         """
-        fingers = [0, 0, 0, 0, 0]  # Default: all fingers down
+        fingers = []
         if len(lm_list) >= 21:
             # Thumb
             if lm_list[4][1] < lm_list[3][1]:  # For right hand
-                fingers[0] = 1
+                fingers.append(1)
+            else:
+                fingers.append(0)
             # Index
             if lm_list[8][2] < lm_list[6][2]:
-                fingers[1] = 1
+                fingers.append(1)
+            else:
+                fingers.append(0)
             # Middle
             if lm_list[12][2] < lm_list[10][2]:
-                fingers[2] = 1
+                fingers.append(1)
+            else:
+                fingers.append(0)
             # Ring
             if lm_list[16][2] < lm_list[14][2]:
-                fingers[3] = 1
+                fingers.append(1)
+            else:
+                fingers.append(0)
             # Pinky
             if lm_list[20][2] < lm_list[18][2]:
-                fingers[4] = 1
+                fingers.append(1)
+            else:
+                fingers.append(0)
         return fingers
