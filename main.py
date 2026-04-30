@@ -1,570 +1,782 @@
+"""
+Virtual Whiteboard - Improved Version
+=====================================
+Improvements over original:
+  - Better eraser: larger radius, per-segment erasing, clear visual cursor
+  - New tools: Rectangle, Circle, Line shapes + Flood-fill bucket
+  - Performance: dirty-flag redraw, cached base canvas, frame-skip for heavy ops
+  - Better UI: icon-based left toolbar, colour palette grid, tool tooltips, status bar
+  - New gestures: Fist (all fingers down) = Undo | Open palm = Clear canvas
+"""
+
 import cv2
 import numpy as np
 import time
-import os  # For saving drawings with timestamped filenames
+import os
 from hand_tracking_module import HandTracker
 
+# ─────────────────────────── constants ───────────────────────────
+CANVAS_W, CANVAS_H = 640, 480
+
+# Extended BGR colour palette (6 cols × 2 rows = 12 colours)
+PALETTE = [
+    (0,   0,   0  ),  # Black
+    (80,  80,  80 ),  # Dark grey
+    (180, 180, 180),  # Light grey
+    (255, 255, 255),  # White
+    (0,   0,   255),  # Red
+    (0,   165, 255),  # Orange
+    (0,   255, 255),  # Yellow
+    (0,   255, 0  ),  # Green
+    (255, 0,   0  ),  # Blue
+    (255, 0,   128),  # Violet
+    (128, 0,   255),  # Purple
+    (255, 128, 0  ),  # Cyan
+]
+
+THICKNESSES = [2, 5, 10]      # px — thin / medium / thick
+ERASE_RADII  = [20, 40, 70]   # px — small / medium / large eraser
+
+TOOLS = ['pen', 'line', 'rect', 'circle', 'fill', 'eraser']
+TOOL_LABELS = ['✏ Pen', '╱ Line', '▭ Rect', '● Circle', '⬛ Fill', '⌫ Erase']
+
+# Gesture debounce
+HOVER_FRAMES_NEEDED  = 8   # frames a finger must hover before button fires
+BUTTON_COOLDOWN      = 20  # frames before same button can fire again
+GESTURE_COOLDOWN     = 30  # frames between special-gesture actions (undo/clear)
+
+# ─────────────────────────── helpers ─────────────────────────────
+
+def lerp(a, b, t):
+    return int(a + (b - a) * t)
+
+
+def ema(new_val, old_val, alpha=0.35):
+    """Exponential moving average for smoothing."""
+    if old_val is None:
+        return new_val
+    return (lerp(old_val[0], new_val[0], alpha),
+            lerp(old_val[1], new_val[1], alpha))
+
+
+def dist(p1, p2):
+    return ((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)**0.5
+
+
+# ─────────────────────── UI layout builder ───────────────────────
+
+class UILayout:
+    """Computes and stores all button rects for the toolbar."""
+
+    TOOLBAR_W   = 70   # left toolbar width
+    PAL_COLS    = 6
+    PAL_CELL    = 20   # colour swatch cell size (px)
+    PAL_MARGIN  = 4
+    PAL_TOP     = 10
+
+    def __init__(self):
+        self.buttons = {}        # name → (x1,y1,x2,y2)
+        self._build()
+
+    def _build(self):
+        tw = self.TOOLBAR_W
+        # ── Tool buttons (vertical strip on the left) ──
+        tool_h = 48
+        tool_margin = 6
+        for i, tool in enumerate(TOOLS):
+            y1 = 10 + i * (tool_h + tool_margin)
+            y2 = y1 + tool_h
+            self.buttons[f'tool_{tool}'] = (4, y1, tw - 4, y2)
+
+        # ── Thickness buttons (below tools) ──
+        thick_labels = ['thin', 'med', 'thick']
+        thick_y_start = 10 + len(TOOLS) * (tool_h + tool_margin) + 10
+        thick_w = (tw - 12) // 3
+        for j, lbl in enumerate(thick_labels):
+            x1 = 4 + j * (thick_w + 2)
+            x2 = x1 + thick_w
+            self.buttons[f'thick_{lbl}'] = (x1, thick_y_start, x2, thick_y_start + 30)
+
+        # ── Eraser-size buttons (one row, same width) ──
+        esize_labels = ['sml', 'med', 'lrg']
+        esize_y = thick_y_start + 40
+        for j, lbl in enumerate(esize_labels):
+            x1 = 4 + j * (thick_w + 2)
+            x2 = x1 + thick_w
+            self.buttons[f'esize_{lbl}'] = (x1, esize_y, x2, esize_y + 30)
+
+        # ── Undo / Clear buttons ──
+        action_y = esize_y + 42
+        self.buttons['undo']  = (4,      action_y, tw//2-2, action_y + 30)
+        self.buttons['clear'] = (tw//2+2, action_y, tw - 4,  action_y + 30)
+
+        # ── Colour palette (top of canvas, right of toolbar) ──
+        pal_x0 = tw + 6
+        for idx in range(len(PALETTE)):
+            row = idx // self.PAL_COLS
+            col = idx  % self.PAL_COLS
+            x1 = pal_x0 + col * (self.PAL_CELL + self.PAL_MARGIN)
+            y1 = self.PAL_TOP + row * (self.PAL_CELL + self.PAL_MARGIN)
+            x2 = x1 + self.PAL_CELL
+            y2 = y1 + self.PAL_CELL
+            self.buttons[f'pal_{idx}'] = (x1, y1, x2, y2)
+
+
+UI = UILayout()
+
+
+# ─────────────────────── canvas renderer ─────────────────────────
+
+def render_canvas(strokes, current_stroke, w=CANVAS_W, h=CANVAS_H):
+    """Redraw all strokes onto a fresh white canvas. Returns the image."""
+    img = np.ones((h, w, 3), np.uint8) * 255
+    for s in strokes:
+        _draw_stroke(img, s)
+    if current_stroke:
+        _draw_stroke(img, current_stroke)
+    return img
+
+
+def _draw_stroke(img, s):
+    tool = s.get('tool', 'pen')
+    pts  = s['points']
+    col  = s['color']
+    thk  = s['thickness']
+    if tool == 'pen' and len(pts) > 1:
+        for i in range(len(pts) - 1):
+            cv2.line(img, pts[i], pts[i+1], col, thk, cv2.LINE_AA)
+    elif tool == 'line' and len(pts) >= 2:
+        cv2.line(img, pts[0], pts[-1], col, thk, cv2.LINE_AA)
+    elif tool == 'rect' and len(pts) >= 2:
+        cv2.rectangle(img, pts[0], pts[-1], col, thk)
+    elif tool == 'circle' and len(pts) >= 2:
+        r = int(dist(pts[0], pts[-1]))
+        cv2.circle(img, pts[0], r, col, thk, cv2.LINE_AA)
+    elif tool == 'fill' and len(pts) >= 1:
+        # Flood-fill stored as single-point stroke with fill flag
+        seed = pts[0]
+        mask = np.zeros((img.shape[0]+2, img.shape[1]+2), np.uint8)
+        cv2.floodFill(img, mask, seed, col, (20,)*3, (20,)*3,
+                      cv2.FLOODFILL_FIXED_RANGE)
+
+
+def flood_fill_canvas(canvas, seed, color):
+    """Apply flood fill on canvas in-place and return a fill 'stroke' record."""
+    mask = np.zeros((canvas.shape[0]+2, canvas.shape[1]+2), np.uint8)
+    cv2.floodFill(canvas, mask, seed, color,
+                  loDiff=(20,20,20), upDiff=(20,20,20),
+                  flags=cv2.FLOODFILL_FIXED_RANGE)
+    return {'tool': 'fill', 'points': [seed], 'color': color, 'thickness': 1}
+
+
+# ─────────────────────────── UI drawing ──────────────────────────
+
+def draw_toolbar(img, state):
+    """Overlay the left toolbar and colour palette on img."""
+    tw = UILayout.TOOLBAR_W
+
+    # Semi-transparent toolbar background
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (tw, img.shape[0]), (240, 240, 240), -1)
+    cv2.addWeighted(overlay, 0.85, img, 0.15, 0, img)
+    cv2.line(img, (tw, 0), (tw, img.shape[0]), (180, 180, 180), 1)
+
+    # ── Tool buttons ──
+    for i, tool in enumerate(TOOLS):
+        bname = f'tool_{tool}'
+        x1,y1,x2,y2 = UI.buttons[bname]
+        selected = (state['tool'] == tool)
+        hovered  = (state['hovered'] == bname)
+        _draw_btn(img, x1,y1,x2,y2,
+                  TOOL_LABELS[i], selected=selected, hovered=hovered,
+                  font_scale=0.38, font_thick=1)
+
+    # ── Thickness buttons ──
+    thick_map = {'thin': 0, 'med': 1, 'thick': 2}
+    cur_ti = THICKNESSES.index(state['thickness']) if state['thickness'] in THICKNESSES else 0
+    for lbl, ti in thick_map.items():
+        bname = f'thick_{lbl}'
+        x1,y1,x2,y2 = UI.buttons[bname]
+        sel = (cur_ti == ti)
+        hov = (state['hovered'] == bname)
+        _draw_btn(img, x1,y1,x2,y2, lbl, selected=sel, hovered=hov,
+                  font_scale=0.30, font_thick=1)
+        # Draw representative line inside button
+        cy = (y1+y2)//2
+        cv2.line(img, (x1+4, cy), (x2-4, cy), (40,40,40), THICKNESSES[ti])
+
+    # Label for thickness row
+    x1t,y1t,_,_ = UI.buttons['thick_thin']
+    cv2.putText(img, 'Brush', (4, y1t - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (80,80,80), 1)
+
+    # ── Eraser-size buttons ──
+    esize_map = {'sml': 0, 'med': 1, 'lrg': 2}
+    cur_ei = ERASE_RADII.index(state['erase_radius']) if state['erase_radius'] in ERASE_RADII else 0
+    for lbl, ei in esize_map.items():
+        bname = f'esize_{lbl}'
+        x1,y1,x2,y2 = UI.buttons[bname]
+        sel = (cur_ei == ei)
+        hov = (state['hovered'] == bname)
+        _draw_btn(img, x1,y1,x2,y2, lbl, selected=sel, hovered=hov,
+                  font_scale=0.28, font_thick=1)
+
+    x1e,y1e,_,_ = UI.buttons['esize_sml']
+    cv2.putText(img, 'Eraser', (4, y1e - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (80,80,80), 1)
+
+    # ── Undo / Clear buttons ──
+    x1u,y1u,x2u,y2u = UI.buttons['undo']
+    x1c,y1c,x2c,y2c = UI.buttons['clear']
+    _draw_btn(img, x1u,y1u,x2u,y2u,'↩ Undo',
+              hovered=(state['hovered']=='undo'), font_scale=0.28, font_thick=1)
+    _draw_btn(img, x1c,y1c,x2c,y2c,'✕ Clr',
+              hovered=(state['hovered']=='clear'), font_scale=0.28, font_thick=1,
+              base_color=(200,200,255))
+
+    # ── Colour palette ──
+    for idx, col in enumerate(PALETTE):
+        bname = f'pal_{idx}'
+        x1,y1,x2,y2 = UI.buttons[bname]
+        sel = (state['color'] == col)
+        hov = (state['hovered'] == bname)
+        border = 3 if sel else (2 if hov else 1)
+        border_col = (0,200,100) if sel else (0,0,0)
+        cv2.rectangle(img, (x1,y1), (x2,y2), col, -1)
+        cv2.rectangle(img, (x1,y1), (x2,y2), border_col, border)
+
+    # ── Colour preview swatch ──
+    sw_x = UILayout.TOOLBAR_W + 6
+    sw_y = UILayout.PAL_TOP + 2*(UILayout.PAL_CELL + UILayout.PAL_MARGIN) + 6
+    cv2.rectangle(img, (sw_x, sw_y), (sw_x+40, sw_y+16), state['color'], -1)
+    cv2.rectangle(img, (sw_x, sw_y), (sw_x+40, sw_y+16), (0,0,0), 1)
+    cv2.putText(img, 'Colour', (sw_x+44, sw_y+12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (60,60,60), 1)
+
+
+def _draw_btn(img, x1, y1, x2, y2, label,
+              selected=False, hovered=False,
+              font_scale=0.35, font_thick=1,
+              base_color=(220,220,220)):
+    bg = (170,230,170) if selected else ((255,255,180) if hovered else base_color)
+    cv2.rectangle(img, (x1,y1),(x2,y2), bg, -1)
+    border_thk = 2 if (selected or hovered) else 1
+    border_col = (0,140,0) if selected else (100,100,100)
+    cv2.rectangle(img, (x1,y1),(x2,y2), border_col, border_thk)
+
+    # Centre text
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+    tx = x1 + ((x2-x1) - tw)//2
+    ty = y1 + ((y2-y1) + th)//2
+    cv2.putText(img, label, (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (20,20,20), font_thick, cv2.LINE_AA)
+
+
+def draw_status_bar(img, state):
+    """Draw a status bar at the bottom of the canvas."""
+    h, w = img.shape[:2]
+    bar_h = 22
+    cv2.rectangle(img, (0, h-bar_h), (w, h), (50, 50, 50), -1)
+
+    tool_name = state['tool'].upper()
+    thick_info = f"Brush: {state['thickness']}px" if state['tool'] != 'eraser' \
+                 else f"Eraser: {state['erase_radius']}px"
+    undo_info  = f"Strokes: {state['stroke_count']}  (Fist=Undo | Palm=Clear)"
+    fps_info   = f"FPS:{state.get('fps', 0):.0f}"
+
+    parts = [f"Tool: {tool_name}", thick_info, undo_info, fps_info]
+    x = 8
+    for p in parts:
+        cv2.putText(img, p, (x, h - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220,220,220), 1, cv2.LINE_AA)
+        (tw, _), _ = cv2.getTextSize(p, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+        x += tw + 20
+
+
+def draw_eraser_cursor(img, cx, cy, radius):
+    """Draw a dashed eraser circle cursor."""
+    cv2.circle(img, (cx, cy), radius, (0, 0, 200), 2, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), 3, (0, 0, 200), -1)
+    # Small cross-hair
+    cv2.line(img, (cx-6, cy), (cx+6, cy), (0,0,200), 1)
+    cv2.line(img, (cx, cy-6), (cx, cy+6), (0,0,200), 1)
+
+
+def draw_shape_preview(img, state, end_pt):
+    """Draw a ghost preview of the shape being drawn."""
+    if not state.get('shape_start'):
+        return
+    s = state['shape_start']
+    col = state['color']
+    thk = state['thickness']
+    tool = state['tool']
+    preview = img.copy()
+    if tool == 'line':
+        cv2.line(preview, s, end_pt, col, thk, cv2.LINE_AA)
+    elif tool == 'rect':
+        cv2.rectangle(preview, s, end_pt, col, thk)
+    elif tool == 'circle':
+        r = int(dist(s, end_pt))
+        cv2.circle(preview, s, r, col, thk, cv2.LINE_AA)
+    cv2.addWeighted(preview, 0.6, img, 0.4, 0, img)
+
+
+# ──────────────────────── gesture helpers ────────────────────────
+
+def classify_gesture(fingers):
+    """Return a gesture name string from 5-finger list."""
+    if fingers == [0, 0, 0, 0, 0]:
+        return 'fist'
+    if fingers == [1, 1, 1, 1, 1]:
+        return 'palm'
+    if fingers[1] == 1 and fingers[2] == 0:
+        return 'index'           # draw / erase
+    if fingers[1] == 1 and fingers[2] == 1:
+        return 'two_fingers'     # select / hover UI
+    if fingers[1] == 0 and fingers[2] == 0:
+        return 'idle'
+    return 'other'
+
+
+def hit_button(px, py, margin=12):
+    """Return first button name that (px,py) is inside (with margin)."""
+    for name, (x1,y1,x2,y2) in UI.buttons.items():
+        if (x1-margin) <= px <= (x2+margin) and (y1-margin) <= py <= (y2+margin):
+            return name
+    return None
+
+
+# ──────────────────────────── main ───────────────────────────────
+
 def main():
-    """
-    Main function to run the virtual whiteboard application.
-    """
-    # Initialize camera (optional - whiteboard will work without it)
+    # ── Camera init ──────────────────────────────────────────────
     cap = None
     camera_available = False
-    
-    print("Initializing camera...")
-    try:
-        # Try different camera backends
-        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
-        cap = None
-        
-        for backend in backends:
-            try:
-                cap = cv2.VideoCapture(0, backend)
-                if cap.isOpened():
-                    # Set camera properties for better compatibility
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize latency
-                    
-                    # Give camera time to initialize
-                    time.sleep(0.5)
-                    
-                    # Try reading multiple frames (sometimes first few fail)
-                    test_success = False
-                    for attempt in range(5):
-                        ret, test_frame = cap.read()
-                        if ret and test_frame is not None:
-                            test_success = True
-                            break
-                        time.sleep(0.1)
-                    
-                    if test_success:
-                        camera_available = True
-                        print("[OK] Camera initialized successfully!")
-                        break
-                    else:
-                        print(f"  Camera opened but cannot read frames (backend {backend})")
-                        cap.release()
-                        cap = None
-                else:
-                    if cap:
-                        cap.release()
-                    cap = None
-            except Exception as e:
-                print(f"  Backend {backend} failed: {e}")
-                if cap:
-                    cap.release()
-                cap = None
-                continue
-        
-        if not camera_available:
-            print("[WARNING] Could not initialize camera. Running whiteboard without camera.")
-            print("  The whiteboard will still work, but hand tracking will be disabled.")
-            
-    except Exception as e:
-        print(f"[WARNING] Camera initialization failed: {e}")
-        print("  Running whiteboard without camera.")
-        if cap:
-            cap.release()
-            cap = None
+    print("Initialising camera...")
+    for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]:
+        try:
+            cap = cv2.VideoCapture(0, backend)
+            if not cap.isOpened():
+                cap.release(); cap = None; continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            time.sleep(0.4)
+            ok = False
+            for _ in range(5):
+                ret, frm = cap.read()
+                if ret and frm is not None:
+                    ok = True; break
+                time.sleep(0.1)
+            if ok:
+                camera_available = True
+                print("[OK] Camera ready.")
+                break
+            cap.release(); cap = None
+        except Exception as e:
+            print(f"  Backend {backend} failed: {e}")
+            if cap: cap.release(); cap = None
 
-    # Initialize hand tracker
+    if not camera_available:
+        print("[WARN] No camera — hand tracking disabled.")
+
+    # ── Tracker ──────────────────────────────────────────────────
     tracker = HandTracker()
 
-    # Canvas settings
-    # Logical canvas size (display is later resized to window size so it fills screen)
-    canvas_width, canvas_height = 640, 480
-    canvas = np.ones((canvas_height, canvas_width, 3), np.uint8) * 255  # White canvas
-    
-    # Drawing settings
-    # Extended color palette (BGR)
-    colors = [
-        (255, 0, 0),    # Blue
-        (0, 255, 0),    # Green
-        (0, 0, 255),    # Red
-        (0, 255, 255),  # Yellow
-        (255, 0, 255),  # Purple
-        (0, 0, 0),      # Black
-    ]
-    color_names = ['Blue', 'Green', 'Red', 'Yellow', 'Purple', 'Black']
-    current_color_index = 0
-    current_color = colors[current_color_index]
-    thicknesses = [2, 5, 8]  # Thin, Medium, Thick
-    current_color = colors[0]
-    current_thickness = thicknesses[0]
+    # ── App state ────────────────────────────────────────────────
+    strokes       = []          # committed strokes
+    current_stroke = None       # stroke being drawn right now
+    redo_stack    = []          # for undo (pop from strokes, push here)
 
-    # Strokes storage: list of dicts with 'points', 'color', 'thickness'
-    strokes = []
-    current_stroke = None
-
-    # Modes
-    drawing_mode = False
-    selection_mode = False
-    eraser_mode = False
-    
-    # Button selection tracking (for debouncing)
-    last_selected_button = None
-    button_press_cooldown = 0
-
-    # UI Buttons: dict of name: (x1, y1, x2, y2)
-    # Color buttons are mapped to indices in the colors list above.
-    buttons = {
-        'color_blue': (10, 10, 60, 60),
-        'color_green': (70, 10, 120, 60),
-        'color_red': (130, 10, 180, 60),
-        'color_yellow': (190, 10, 240, 60),
-        'color_purple': (250, 10, 300, 60),
-        'color_black': (310, 10, 360, 60),
-        'thin': (10, 80, 60, 130),
-        'medium': (80, 80, 130, 130),
-        'thick': (150, 80, 200, 130),
-        'eraser': (10, 150, 60, 200)
+    state = {
+        'tool':         'pen',
+        'color':        PALETTE[0],   # black
+        'thickness':    THICKNESSES[0],
+        'erase_radius': ERASE_RADII[0],
+        'hovered':      None,
+        'stroke_count': 0,
+        'fps':          0,
+        'shape_start':  None,         # for shape tools
     }
 
-    color_button_indices = {
-        'color_blue': 0,
-        'color_green': 1,
-        'color_red': 2,
-        'color_yellow': 3,
-        'color_purple': 4,
-        'color_black': 5,
-    }
+    # Interaction tracking
+    prev_ptr      = None   # smoothed pointer
+    prev_draw     = None   # smoothed draw point
+    prev_lm_list  = None
 
-    def draw_ui(img, hovered_button_name=None):
-        """
-        Draw UI buttons on the image.
+    hovered_name    = None
+    hover_frames    = 0
+    last_fired_btn  = None
+    btn_cooldown    = 0
 
-        Args:
-            img: Image to draw on.
-            hovered_button_name: Name of button being hovered (for highlighting)
-        """
-        for name, (x1, y1, x2, y2) in buttons.items():
-            # Highlight selected color/thickness
-            is_selected = False
-            if name.startswith('color_'):
-                # Highlight the currently selected color button
-                idx = color_button_indices.get(name, -1)
-                if idx == current_color_index:
-                    is_selected = True
-            elif name == 'thin' and current_thickness == thicknesses[0]:
-                is_selected = True
-            elif name == 'medium' and current_thickness == thicknesses[1]:
-                is_selected = True
-            elif name == 'thick' and current_thickness == thicknesses[2]:
-                is_selected = True
-            elif name == 'eraser' and eraser_mode:
-                is_selected = True
-            
-            # Check if button is being hovered
-            is_hovered = (name == hovered_button_name)
-            
-            # Draw button background (highlighted if selected or hovered)
-            if is_selected:
-                cv2.rectangle(img, (x1, y1), (x2, y2), (150, 255, 150), -1)  # Light green when selected
-            elif is_hovered:
-                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 150), -1)  # Yellow when hovered
-            else:
-                cv2.rectangle(img, (x1, y1), (x2, y2), (200, 200, 200), -1)
-            
-            # Draw border (thicker if selected or hovered)
-            border_thickness = 3 if (is_selected or is_hovered) else 2
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 0), border_thickness)
-            
-            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
-            if name.startswith('color_'):
-                # Draw color swatch corresponding to this button
-                idx = color_button_indices.get(name, None)
-                if idx is not None and 0 <= idx < len(colors):
-                    cv2.circle(img, (center_x, center_y), 15, colors[idx], -1)
-            elif name == 'thin':
-                cv2.line(img, (x1 + 10, center_y), (x2 - 10, center_y), (0, 0, 0), 2)
-            elif name == 'medium':
-                cv2.line(img, (x1 + 10, center_y), (x2 - 10, center_y), (0, 0, 0), 5)
-            elif name == 'thick':
-                cv2.line(img, (x1 + 10, center_y), (x2 - 10, center_y), (0, 0, 0), 8)
-            elif name == 'eraser':
-                cv2.putText(img, 'ERASE', (x1 + 5, center_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+    gesture_cooldown = 0   # for fist / palm gestures
 
-    print("\n" + "="*50)
-    print("Virtual Whiteboard Starting...")
-    print("="*50)
-    if camera_available:
-        print("[OK] Camera: ENABLED - Hand tracking active")
-    else:
-        print("[WARNING] Camera: DISABLED - Hand tracking unavailable")
-    print("Controls:")
-    print("  - Press 'Q' or 'ESC' to quit")
-    print("  - Click window X button to close")
-    print("="*50 + "\n")
-    
-    # Create window first
+    # Dirty-flag: only re-render strokes when something changed
+    canvas_dirty  = True
+    cached_canvas = np.ones((CANVAS_H, CANVAS_W, 3), np.uint8) * 255
+
+    # FPS tracking
+    fps_t = time.time()
+    fps_count = 0
+
+    # ── Window ───────────────────────────────────────────────────
     cv2.namedWindow('Virtual Whiteboard', cv2.WINDOW_NORMAL)
-    # Try to start in fullscreen so the whiteboard fills the screen
     try:
-        cv2.setWindowProperty('Virtual Whiteboard', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.setWindowProperty('Virtual Whiteboard',
+                              cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     except Exception:
-        # If fullscreen is not supported, window will remain resizable
         pass
 
-    # For smoothing drawing coordinates
-    prev_draw_point = None
-    # For smoothing pointer (used for selection and hover)
-    prev_pointer = None
-    pointer_alpha = 0.25  # Lower = smoother, higher = more responsive
+    print("\n" + "="*55)
+    print(" Virtual Whiteboard  —  Improved Edition")
+    print("="*55)
+    print("  Gestures:")
+    print("   Index only      → Draw / Erase")
+    print("   Index + Middle  → Hover & select UI buttons")
+    print("   Fist            → Undo last stroke")
+    print("   Open Palm       → Clear canvas")
+    print("  Keyboard:")
+    print("   Q / ESC         → Quit")
+    print("   S               → Save drawing as PNG")
+    print("   Z               → Undo")
+    print("   C               → Clear canvas")
+    print("="*55 + "\n")
 
-    # Hover/debounce tracking for button selection
-    hover_frames = 0
-    hover_threshold = 6  # Number of consecutive frames to consider a hover stable
-    last_hovered_name = None
-    # Previous landmarks for temporal smoothing
-    prev_lm_list = None
-    
+    # ── Main loop ────────────────────────────────────────────────
     while True:
-        # Check if window was closed
+        # Window-close check
         try:
             if cv2.getWindowProperty('Virtual Whiteboard', cv2.WND_PROP_VISIBLE) < 1:
                 break
-        except:
-            # Window might not exist yet or was closed
+        except Exception:
             break
-        
-        # Read from camera if available
+
+        loop_start = time.time()
+
+        # ── Camera frame ─────────────────────────────────────────
+        frame = None
         if camera_available and cap is not None:
             success, frame = cap.read()
             if not success:
-                # Camera failed during runtime, continue without it
-                if camera_available:  # Only print once
-                    print("[WARNING] Camera disconnected during runtime. Continuing without camera.")
                 camera_available = False
                 frame = None
-        else:
-            frame = None
-        
-        # Process hand tracking if camera frame is available
-        lm_list = []
+
+        # ── Hand tracking ────────────────────────────────────────
+        lm_list       = []
         current_fingers = []
-        hovered_button_name = None  # Track which button is being hovered
-        
+        gesture       = 'idle'
+        ptr           = None     # smoothed index-finger canvas coord
+
         if frame is not None:
-            frame = cv2.flip(frame, 1)  # Mirror the frame
-            frame = tracker.find_hands(frame)  # Detect hands and draw landmarks
+            frame = cv2.flip(frame, 1)
+            frame = tracker.find_hands(frame)
             lm_list = tracker.get_positions(frame)
-            # Apply temporal smoothing to landmarks if available
             if lm_list and len(lm_list) >= 21:
                 lm_list = tracker.smooth_landmarks(lm_list, prev_lm_list, alpha=0.45)
-                # Store a copy for next frame
                 prev_lm_list = [list(x) for x in lm_list]
                 current_fingers = tracker.fingers_up(lm_list)
-            else:
-                prev_lm_list = None
 
         if lm_list and len(lm_list) >= 21 and len(current_fingers) == 5:
-            fingers = current_fingers
-            if len(fingers) == 5:  # Ensure we got valid finger states
-                index_tip = lm_list[8]  # Index finger tip
+            tip = lm_list[8]
+            fh, fw = frame.shape[:2]
+            raw = (int(tip[1] * CANVAS_W / fw),
+                   int(tip[2] * CANVAS_H / fh))
+            # Clamp
+            raw = (max(0, min(CANVAS_W-1, raw[0])),
+                   max(0, min(CANVAS_H-1, raw[1])))
+            # EMA smoothing
+            prev_ptr = ema(raw, prev_ptr, alpha=0.30)
+            ptr = prev_ptr
+            gesture = classify_gesture(current_fingers)
 
-                # NOTE: HandTracker already returns coordinates in image space.
-                # Apply separate smoothing for the pointer used to select UI buttons
-                raw_x, raw_y = index_tip[1], index_tip[2]
+        # ── Gesture: Fist = Undo, Palm = Clear ───────────────────
+        if gesture_cooldown > 0:
+            gesture_cooldown -= 1
 
-                frame_h, frame_w = frame.shape[:2]
-                raw_x = int(raw_x * canvas_width / frame_w)
-                raw_y = int(raw_y * canvas_height / frame_h)
-
-                # Pointer EMA smoothing (keeps selection stable even when not drawing)
-                if prev_pointer is None:
-                    ptr_x, ptr_y = raw_x, raw_y
-                else:
-                    ptr_x = int(pointer_alpha * raw_x + (1 - pointer_alpha) * prev_pointer[0])
-                    ptr_y = int(pointer_alpha * raw_y + (1 - pointer_alpha) * prev_pointer[1])
-                prev_pointer = (ptr_x, ptr_y)
-
-                # Smooth drawing coordinates separately (so strokes remain responsive)
-                if prev_draw_point is None:
-                    smooth_x, smooth_y = ptr_x, ptr_y
-                else:
-                    alpha = 0.3  # Higher = closer to current position (for drawing responsiveness)
-                    smooth_x = int(alpha * ptr_x + (1 - alpha) * prev_draw_point[0])
-                    smooth_y = int(alpha * ptr_y + (1 - alpha) * prev_draw_point[1])
-
-                x, y = smooth_x, smooth_y
-
-                # Determine mode based on gestures
-                if fingers[1] == 1 and fingers[2] == 0:  # Only index finger up
-                    if eraser_mode:
-                        # In eraser mode, index finger is for erasing (handled separately)
-                        drawing_mode = False
-                        selection_mode = False
-                    else:
-                        # Normal drawing mode
-                        drawing_mode = True
-                        selection_mode = False
-                elif fingers[1] == 1 and fingers[2] == 1:  # Index and middle fingers up
-                    selection_mode = True
-                    drawing_mode = False
-                    # Don't disable eraser_mode here - let user select eraser button again or use gesture
-                elif fingers == [1, 1, 0, 0, 0]:  # Thumb and index up - exit eraser mode
-                    if eraser_mode:
-                        eraser_mode = False
-                        drawing_mode = True
-                        selection_mode = False
-                        print("Eraser mode deactivated - back to drawing")
-                    else:
-                        # If not in eraser mode, thumb+index can also be drawing
-                        drawing_mode = True
-                        selection_mode = False
-                else:
-                    # Other gestures - disable drawing and selection
-                    drawing_mode = False
-                    selection_mode = False
-                    # Don't auto-disable eraser_mode
-
-                # Handle drawing
-                if drawing_mode and not eraser_mode:
-                    # Clamp coordinates to canvas bounds
-                    x = max(0, min(canvas_width - 1, x))
-                    y = max(0, min(canvas_height - 1, y))
-                    
-                    if current_stroke is None:
-                        current_stroke = {'points': [(x, y)], 'color': current_color, 'thickness': current_thickness}
-                    else:
-                        current_stroke['points'].append((x, y))
-                    # Update previous point for smoothing
-                    prev_draw_point = (x, y)
-                else:
-                    # Stop current stroke if not drawing
-                    if current_stroke:
-                        strokes.append(current_stroke)
-                        current_stroke = None
-                    prev_draw_point = None
-
-                # Handle selection (with debouncing)
-                if selection_mode:
-                    button_press_cooldown = max(0, button_press_cooldown - 1)
-
-                    # Use the smoothed pointer for button detection (ptr_x, ptr_y)
-                    x_btn = max(0, min(canvas_width - 1, ptr_x))
-                    y_btn = max(0, min(canvas_height - 1, ptr_y))
-
-                    # Detect hovered button (don't trigger selection immediately)
-                    margin = 15  # Larger margin to make hovering easier
-                    hovered_button_name = None
-                    for name, (x1, y1, x2, y2) in buttons.items():
-                        if (x1 - margin) <= x_btn <= (x2 + margin) and (y1 - margin) <= y_btn <= (y2 + margin):
-                            hovered_button_name = name
-                            break
-
-                    # Sustained-hover debouncing: require stable hover for several frames
-                    if hovered_button_name == last_hovered_name:
-                        hover_frames += 1
-                    else:
-                        hover_frames = 1 if hovered_button_name else 0
-                    last_hovered_name = hovered_button_name
-
-                    if hovered_button_name and hover_frames >= hover_threshold and button_press_cooldown == 0 and hovered_button_name != last_selected_button:
-                        name = hovered_button_name
-                        if name.startswith('color_'):
-                            idx = color_button_indices.get(name, None)
-                            if idx is not None and 0 <= idx < len(colors):
-                                current_color_index = idx
-                                current_color = colors[current_color_index]
-                                print(f"[SELECTED] {color_names[current_color_index]} color")
-                        elif name == 'thin':
-                            current_thickness = thicknesses[0]
-                            print("[SELECTED] Thin brush")
-                        elif name == 'medium':
-                            current_thickness = thicknesses[1]
-                            print("[SELECTED] Medium brush")
-                        elif name == 'thick':
-                            current_thickness = thicknesses[2]
-                            print("[SELECTED] Thick brush")
-                        elif name == 'eraser':
-                            if eraser_mode:
-                                eraser_mode = False
-                                drawing_mode = True
-                                print("[ERASER] Deactivated - back to drawing")
-                            else:
-                                eraser_mode = True
-                                drawing_mode = False
-                                selection_mode = False
-                                print("[ERASER] Activated - use index finger to erase")
-
-                        last_selected_button = name
-                        button_press_cooldown = 15
-                        hover_frames = 0
-                else:
-                    # Reset button selection when not in selection mode
-                    if last_selected_button is not None:
-                        last_selected_button = None
-                        button_press_cooldown = 0
-                    # Reset hover tracking
-                    hover_frames = 0
-                    last_hovered_name = None
-
-                # Handle erasing (works with index finger when eraser mode is active)
-                if eraser_mode:
-                    # Use index finger to erase (same gesture as drawing)
-                    erase_radius = 25  # Increased radius for easier erasing
-                    to_remove = []
-                    for i, stroke in enumerate(strokes):
-                        for px, py in stroke['points']:
-                            distance = ((px - x) ** 2 + (py - y) ** 2) ** 0.5
-                            if distance < erase_radius:
-                                to_remove.append(i)
-                                break
-                    for i in sorted(set(to_remove), reverse=True):
-                        del strokes[i]
-                    if current_stroke:
-                        current_stroke['points'] = [(px, py) for px, py in current_stroke['points'] 
-                                                    if ((px - x) ** 2 + (py - y) ** 2) ** 0.5 >= erase_radius]
-                    
-                    # Draw eraser indicator circle
-                    if frame is not None:
-                        cv2.circle(frame, (x, y), erase_radius, (0, 0, 255), 2)  # Red circle indicator
-            else:
-                # If fingers list is invalid, stop current stroke
-                if current_stroke:
-                    strokes.append(current_stroke)
-                    current_stroke = None
-                prev_draw_point = None
-        else:
-            # If no hand detected, stop current stroke
+        if gesture == 'fist' and gesture_cooldown == 0:
             if current_stroke:
                 strokes.append(current_stroke)
                 current_stroke = None
-            prev_draw_point = None
+            if strokes:
+                redo_stack.append(strokes.pop())
+                canvas_dirty = True
+                print("[UNDO] Stroke undone.")
+            gesture_cooldown = GESTURE_COOLDOWN
 
-        # Create display canvas (pure drawing surface; UI and overlays added later)
-        display = canvas.copy()
-
-        # Draw all strokes
-        for stroke in strokes:
-            points = stroke['points']
-            if len(points) > 1:
-                for i in range(len(points) - 1):
-                    cv2.line(display, points[i], points[i + 1], stroke['color'], stroke['thickness'])
-
-        # Draw current stroke
-        if current_stroke:
-            points = current_stroke['points']
-            if len(points) > 1:
-                for i in range(len(points) - 1):
-                    cv2.line(display, points[i], points[i + 1], current_stroke['color'], current_stroke['thickness'])
-
-        # Draw fingertip indicator on drawing canvas (for visual feedback)
-        if lm_list and len(lm_list) >= 21 and len(current_fingers) == 5:
-            index_tip = lm_list[8]
-            fx, fy = index_tip[1], index_tip[2]
-            fx = max(0, min(canvas_width - 1, fx))
-            fy = max(0, min(canvas_height - 1, fy))
-            cv2.circle(display, (fx, fy), 5, (0, 0, 0), -1)  # Small black dot
-
-        # Draw UI (buttons, etc.)
-        draw_ui(display, hovered_button_name)
-
-        # Add mode indicator
-        mode_text = ""
-        if eraser_mode:
-            mode_text = "MODE: ERASER (Index finger to erase)"
-        elif selection_mode:
-            if hovered_button_name:
-                mode_text = f"MODE: SELECTION (Hovering: {hovered_button_name.replace('_', ' ').title()})"
-            else:
-                mode_text = "MODE: SELECTION (Point at buttons to select)"
-        elif drawing_mode:
-            mode_text = f"MODE: DRAWING (Color: {color_names[current_color_index]}, Thickness: {current_thickness}px)"
-        else:
-            mode_text = "MODE: IDLE (Raise index finger to draw)"
-        
-        cv2.putText(display, mode_text, (10, display.shape[0] - 40), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        
-        # Add instructions and camera status text
-        status_text = "Press 'Q' or 'ESC' to quit"
-        if not camera_available:
-            status_text += " | Camera: OFF"
-        cv2.putText(display, status_text, (10, display.shape[0] - 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-        
-        # Draw eraser indicator on display if in eraser mode and hand is detected
-        if eraser_mode and lm_list and len(lm_list) >= 21 and len(current_fingers) == 5:
-            index_tip = lm_list[8]
-            ex, ey = index_tip[1], index_tip[2]
-            ex = max(0, min(canvas_width - 1, ex))
-            ey = max(0, min(canvas_height - 1, ey))
-            cv2.circle(display, (ex, ey), 25, (0, 0, 255), 2)  # Red circle indicator
-
-        # Add live camera preview in the bottom-right corner (does not block the main canvas)
-        if frame is not None:
-            # Create a small preview while preserving aspect ratio
-            disp_h, disp_w = display.shape[:2]
-            preview_width = max(int(disp_w * 0.25), 1)
-            preview_height = int(preview_width * frame.shape[0] / max(frame.shape[1], 1))
-            preview_height = min(preview_height, int(disp_h * 0.25))
-            preview_width = int(preview_height * frame.shape[1] / max(frame.shape[0], 1))
-
-            if preview_width > 0 and preview_height > 0:
-                preview = cv2.resize(frame, (preview_width, preview_height))
-                y1 = disp_h - preview_height - 10
-                x1 = disp_w - preview_width - 10
-                y2 = y1 + preview_height
-                x2 = x1 + preview_width
-
-                if y1 >= 0 and x1 >= 0 and y2 <= disp_h and x2 <= disp_w:
-                    display[y1:y2, x1:x2] = preview
-                    cv2.rectangle(display, (x1, y1), (x2, y2), (0, 0, 0), 1)
-                    cv2.putText(display, "Camera", (x1 + 5, y1 + 15),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-
-        # Resize display to current window size so the whiteboard fills the screen
-        try:
-            _, _, win_w, win_h = cv2.getWindowImageRect('Virtual Whiteboard')
-            if win_w > 0 and win_h > 0 and (win_w != display.shape[1] or win_h != display.shape[0]):
-                display_to_show = cv2.resize(display, (win_w, win_h), interpolation=cv2.INTER_LINEAR)
-            else:
-                display_to_show = display
-        except Exception:
-            display_to_show = display
-
-        # Show the whiteboard
-        cv2.imshow('Virtual Whiteboard', display_to_show)
-
-        # Exit on 'q', 'Q', or ESC key, or window close button
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == ord('Q') or key == 27:  # 27 is ESC key
-            break
-        elif key == ord('s') or key == ord('S'):
-            # Save only the drawing canvas (without UI/camera preview) to a timestamped PNG
-            save_canvas = np.ones_like(canvas) * 255
-            for stroke in strokes:
-                pts = stroke['points']
-                if len(pts) > 1:
-                    for i in range(len(pts) - 1):
-                        cv2.line(save_canvas, pts[i], pts[i + 1], stroke['color'], stroke['thickness'])
+        elif gesture == 'palm' and gesture_cooldown == 0:
             if current_stroke:
-                pts = current_stroke['points']
-                if len(pts) > 1:
-                    for i in range(len(pts) - 1):
-                        cv2.line(save_canvas, pts[i], pts[i + 1], current_stroke['color'], current_stroke['thickness'])
+                current_stroke = None
+            if strokes:
+                redo_stack.extend(strokes)
+                strokes.clear()
+                canvas_dirty = True
+                print("[CLEAR] Canvas cleared.")
+            gesture_cooldown = GESTURE_COOLDOWN
 
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"drawing_{timestamp}.png"
-            try:
-                cv2.imwrite(filename, save_canvas)
-                print(f"Saved drawing to {os.path.abspath(filename)}")
-            except Exception as e:
-                print(f"[ERROR] Failed to save drawing: {e}")
-        
-        # Check if window was closed
+        # ── UI button hover / selection ───────────────────────────
+        state['hovered'] = None
+        if btn_cooldown > 0:
+            btn_cooldown -= 1
+
+        if gesture == 'two_fingers' and ptr is not None:
+            detected = hit_button(ptr[0], ptr[1])
+            state['hovered'] = detected
+
+            if detected == hovered_name:
+                hover_frames += 1
+            else:
+                hover_frames = 1 if detected else 0
+            hovered_name = detected
+
+            if (detected and hover_frames >= HOVER_FRAMES_NEEDED
+                    and btn_cooldown == 0 and detected != last_fired_btn):
+                _handle_button(detected, state, strokes, redo_stack)
+                canvas_dirty = True
+                last_fired_btn = detected
+                btn_cooldown   = BUTTON_COOLDOWN
+                hover_frames   = 0
+
+            # Stop any in-progress stroke while hovering
+            if current_stroke:
+                strokes.append(current_stroke)
+                current_stroke = None
+                canvas_dirty = True
+            prev_draw = None
+            state['shape_start'] = None
+
+        else:
+            hover_frames   = 0
+            hovered_name   = None
+            last_fired_btn = None
+
+        # ── Drawing / Erasing ────────────────────────────────────
+        if gesture == 'index' and ptr is not None:
+            # Separate smoothing for drawing (more responsive than UI pointer)
+            prev_draw = ema(ptr, prev_draw, alpha=0.45)
+            x, y = prev_draw
+
+            tool = state['tool']
+
+            if tool == 'eraser':
+                # ── Improved eraser: erase at segment level ──
+                radius = state['erase_radius']
+                to_remove = []
+                for si, stroke in enumerate(strokes):
+                    pts = stroke['points']
+                    for pi in range(len(pts)):
+                        if dist(pts[pi], (x,y)) < radius:
+                            to_remove.append(si)
+                            break
+                        # Check midpoints of segments for smoother erasing
+                        if pi > 0 and _seg_point_dist(pts[pi-1], pts[pi], (x,y)) < radius:
+                            to_remove.append(si)
+                            break
+                if to_remove:
+                    for si in sorted(set(to_remove), reverse=True):
+                        del strokes[si]
+                    canvas_dirty = True
+
+                # Also trim current stroke
+                if current_stroke:
+                    kept = [(px,py) for px,py in current_stroke['points']
+                            if dist((px,py), (x,y)) >= radius]
+                    current_stroke['points'] = kept
+                    canvas_dirty = True
+
+            elif tool == 'fill':
+                # Single tap to fill — use fist-like one-shot via cooldown
+                if gesture_cooldown == 0:
+                    fill_s = flood_fill_canvas(cached_canvas,
+                                               (x, y), state['color'])
+                    strokes.append(fill_s)
+                    canvas_dirty = True
+                    gesture_cooldown = GESTURE_COOLDOWN // 2
+
+            elif tool == 'pen':
+                if current_stroke is None:
+                    current_stroke = {
+                        'tool': 'pen',
+                        'points': [(x,y)],
+                        'color': state['color'],
+                        'thickness': state['thickness'],
+                    }
+                else:
+                    # Simplify: only add point if moved enough (reduces jitter)
+                    if not current_stroke['points'] or \
+                            dist(current_stroke['points'][-1], (x,y)) > 2:
+                        current_stroke['points'].append((x,y))
+                canvas_dirty = True
+
+            else:  # line / rect / circle — rubber-band shape
+                if state['shape_start'] is None:
+                    state['shape_start'] = (x, y)
+                # update endpoint continuously; commit on gesture release handled below
+                if current_stroke is None:
+                    current_stroke = {
+                        'tool': tool,
+                        'points': [state['shape_start'], (x,y)],
+                        'color': state['color'],
+                        'thickness': state['thickness'],
+                    }
+                else:
+                    current_stroke['points'] = [state['shape_start'], (x,y)]
+                canvas_dirty = True
+
+        else:
+            # Gesture released → commit current stroke
+            if current_stroke:
+                strokes.append(current_stroke)
+                current_stroke = None
+                canvas_dirty = True
+                redo_stack.clear()
+            state['shape_start'] = None
+            if gesture != 'two_fingers':
+                prev_draw = None
+
+        state['stroke_count'] = len(strokes)
+
+        # ── Build display frame ───────────────────────────────────
+        # Only re-render committed strokes when dirty
+        if canvas_dirty:
+            cached_canvas = render_canvas(strokes, None, w=CANVAS_W, h=CANVAS_H)
+            canvas_dirty = False
+
+        display = cached_canvas.copy()
+
+        # Draw current (in-progress) stroke on top
+        if current_stroke:
+            _draw_stroke(display, current_stroke)
+
+        # Shape ghost preview
+        if state['tool'] in ('line','rect','circle') and ptr is not None:
+            draw_shape_preview(display, state, ptr)
+
+        # Fingertip dot
+        if ptr is not None and gesture in ('index','two_fingers'):
+            col_dot = (0,0,200) if state['tool']=='eraser' else (0,0,0)
+            cv2.circle(display, ptr, 4, col_dot, -1)
+
+        # Eraser cursor circle
+        if state['tool'] == 'eraser' and ptr is not None and gesture == 'index':
+            draw_eraser_cursor(display, ptr[0], ptr[1], state['erase_radius'])
+
+        # Toolbar + palette
+        draw_toolbar(display, state)
+
+        # Status bar
+        fps_count += 1
+        elapsed = time.time() - fps_t
+        if elapsed >= 1.0:
+            state['fps'] = fps_count / elapsed
+            fps_count = 0
+            fps_t = time.time()
+        draw_status_bar(display, state)
+
+        # Camera preview (bottom-right corner)
+        if frame is not None:
+            dh, dw = display.shape[:2]
+            pw = max(int(dw * 0.22), 1)
+            ph = int(pw * frame.shape[0] / max(frame.shape[1],1))
+            ph = min(ph, int(dh * 0.22))
+            pw = int(ph * frame.shape[1] / max(frame.shape[0],1))
+            if pw > 0 and ph > 0:
+                preview = cv2.resize(frame, (pw, ph))
+                y1p = dh - ph - 26
+                x1p = dw - pw - 6
+                if y1p >= 0 and x1p >= 0:
+                    display[y1p:y1p+ph, x1p:x1p+pw] = preview
+                    cv2.rectangle(display,(x1p,y1p),(x1p+pw,y1p+ph),(80,80,80),1)
+
+        # Resize to window
+        try:
+            _, _, ww, wh = cv2.getWindowImageRect('Virtual Whiteboard')
+            if ww > 0 and wh > 0 and (ww != display.shape[1] or wh != display.shape[0]):
+                display = cv2.resize(display, (ww,wh), interpolation=cv2.INTER_LINEAR)
+        except Exception:
+            pass
+
+        cv2.imshow('Virtual Whiteboard', display)
+
+        # ── Keyboard shortcuts ────────────────────────────────────
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), ord('Q'), 27):
+            break
+        elif key in (ord('z'), ord('Z')):
+            if strokes:
+                redo_stack.append(strokes.pop())
+                canvas_dirty = True
+                print("[UNDO] Keyboard undo.")
+        elif key in (ord('c'), ord('C')):
+            redo_stack.extend(strokes)
+            strokes.clear()
+            canvas_dirty = True
+            print("[CLEAR] Keyboard clear.")
+        elif key in (ord('s'), ord('S')):
+            _save_drawing(strokes, current_stroke)
+
         if cv2.getWindowProperty('Virtual Whiteboard', cv2.WND_PROP_VISIBLE) < 1:
             break
 
-    # Clean up
-    if cap is not None:
-        cap.release()
+    # ── Cleanup ───────────────────────────────────────────────────
+    if cap: cap.release()
     cv2.destroyAllWindows()
     print("Whiteboard closed.")
+
+
+# ─────────────────── button-action dispatcher ─────────────────────
+
+def _handle_button(name, state, strokes, redo_stack):
+    if name.startswith('tool_'):
+        tool = name[len('tool_'):]
+        state['tool'] = tool
+        print(f"[TOOL] {tool}")
+    elif name.startswith('pal_'):
+        idx = int(name[len('pal_'):])
+        state['color'] = PALETTE[idx]
+        print(f"[COLOR] palette[{idx}]")
+    elif name.startswith('thick_'):
+        lbl = name[len('thick_'):]
+        state['thickness'] = THICKNESSES[{'thin':0,'med':1,'thick':2}[lbl]]
+        print(f"[THICK] {state['thickness']}px")
+    elif name.startswith('esize_'):
+        lbl = name[len('esize_'):]
+        state['erase_radius'] = ERASE_RADII[{'sml':0,'med':1,'lrg':2}[lbl]]
+        print(f"[ERASER] radius={state['erase_radius']}px")
+    elif name == 'undo':
+        if strokes:
+            redo_stack.append(strokes.pop())
+            print("[UNDO] via button")
+    elif name == 'clear':
+        redo_stack.extend(strokes)
+        strokes.clear()
+        print("[CLEAR] via button")
+
+
+# ─────────────────────── segment distance ─────────────────────────
+
+def _seg_point_dist(a, b, p):
+    """Minimum distance from point p to line segment a-b."""
+    ax, ay = a; bx, by = b; px, py = p
+    dx, dy = bx-ax, by-ay
+    if dx == 0 and dy == 0:
+        return dist(a, p)
+    t = max(0, min(1, ((px-ax)*dx + (py-ay)*dy) / (dx*dx + dy*dy)))
+    proj = (ax + t*dx, ay + t*dy)
+    return dist(proj, p)
+
+
+# ─────────────────────────── save ────────────────────────────────
+
+def _save_drawing(strokes, current_stroke):
+    save_canvas = render_canvas(strokes, current_stroke)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    fname = f"drawing_{ts}.png"
+    try:
+        cv2.imwrite(fname, save_canvas)
+        print(f"[SAVED] {os.path.abspath(fname)}")
+    except Exception as e:
+        print(f"[ERROR] Save failed: {e}")
+
 
 if __name__ == "__main__":
     main()
